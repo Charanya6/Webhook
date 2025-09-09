@@ -1,7 +1,6 @@
-// Dialogflow ES Webhook (Render/Glitch-ready) — Full ordering flow
-// - In-memory menu & cart (per Dialogflow session)
-// - Intents handled: Default Welcome, GetStoreHours, CheckOrderStatus,
-//   AddToCart, ShowCart, RemoveFromCart, ClearCart, Checkout, Default Fallback
+// Dialogflow ES Webhook (Render-ready) — Ordering flow using menu_items + number params
+// Intents: Default Welcome, GetStoreHours, CheckOrderStatus,
+//          AddToCart, ShowCart, RemoveFromCart, ClearCart, Checkout, Default Fallback
 
 const express = require('express');
 const dotenv = require('dotenv');
@@ -26,7 +25,7 @@ function sessionIdFromReq(req) {
   return parts[1] || 'anon';
 }
 
-// Format as INR (₹). Fallback if Intl not fully supported on host.
+// INR formatting
 function formatINR(n) {
   try {
     return new Intl.NumberFormat('en-IN', { style: 'currency', currency: 'INR' }).format(n);
@@ -36,14 +35,13 @@ function formatINR(n) {
 }
 
 /* --------------------- In-memory data stores -------------------- */
-// NOTE: For demo. If you restart the server, this resets.
-// Swap to MySQL later by replacing these with DB calls.
+// Demo only. Replace with DB later if needed.
 
 const carts = new Map(); // sessionId -> { items:[{item, qty, price}], subtotal }
 const menu = {
-  'pizza':       { name: 'Margherita Pizza', price: 10.99 },
-  'ramen':       { name: 'Spicy Ramen',      price: 12.50 },
-  'veggie bowl': { name: 'Veggie Power Bowl',price:  9.75 }
+  'pizza':       { name: 'Margherita Pizza',  price: 10.99 },
+  'ramen':       { name: 'Spicy Ramen',       price: 12.50 },
+  'veggie bowl': { name: 'Veggie Power Bowl', price:  9.75 }
 };
 
 function getCart(sessionId) {
@@ -54,6 +52,27 @@ function getCart(sessionId) {
 function recalc(cart) {
   cart.subtotal = cart.items.reduce((sum, it) => sum + it.price * it.qty, 0);
   return cart.subtotal;
+}
+
+// Robust parameter getters that prefer your names
+function getItemParam(params) {
+  return (
+    params.menu_items ??     // your preferred name
+    params['menu_items'] ??
+    params['menu item'] ??
+    params.item ??
+    ''
+  ).toString().toLowerCase().trim();
+}
+
+function getQtyParam(params, fallback = 1) {
+  const raw =
+    params.number ??         // your preferred name
+    params['number'] ??
+    params.qty ??
+    fallback;
+  const n = Number(raw);
+  return Number.isFinite(n) && n > 0 ? n : fallback;
 }
 
 /* --------------------------- Handlers --------------------------- */
@@ -79,15 +98,12 @@ function CheckOrderStatus(req) {
 async function AddToCart(req) {
   const sessionId = sessionIdFromReq(req);
   const params = req.body?.queryResult?.parameters || {};
-  // Expecting Dialogflow params like:
-  // - params.item (custom @menu_item entity)
-  // - params.qty  (@sys.number, optional)
-  const rawItem = (params.item ?? '').toString().toLowerCase().trim();
-  const qty = Number(params.qty ?? 1);
+
+  const rawItem = getItemParam(params);
+  const qty = getQtyParam(params, 1);
 
   if (!rawItem) return dfText("Which item would you like to add? Try pizza, ramen, or veggie bowl.");
-  if (!menu[rawItem]) return dfText(`I don’t have "${params.item}". Try pizza, ramen, or veggie bowl.`);
-  if (!(qty >= 1)) return dfText("Quantity must be at least 1.");
+  if (!menu[rawItem]) return dfText(`I don’t have "${rawItem}". Try pizza, ramen, or veggie bowl.`);
 
   const cart = getCart(sessionId);
   const existing = cart.items.find(i => i.item === rawItem);
@@ -95,8 +111,7 @@ async function AddToCart(req) {
   else cart.items.push({ item: rawItem, qty, price: menu[rawItem].price });
 
   const subtotal = recalc(cart);
-  const line = `${menu[rawItem].name} × ${qty} added. Subtotal: ${formatINR(subtotal)}.`;
-  return dfText(line);
+  return dfText(`${menu[rawItem].name} × ${qty} added. Subtotal: ${formatINR(subtotal)}.`);
 }
 
 async function ShowCart(req) {
@@ -106,20 +121,21 @@ async function ShowCart(req) {
 
   const lines = cart.items.map(i => `• ${menu[i.item].name} × ${i.qty} = ${formatINR(i.qty * i.price)}`);
   const subtotal = recalc(cart);
-  const resp = `Your cart:\n${lines.join('\n')}\nSubtotal: ${formatINR(subtotal)}`;
-  return dfText(resp);
+  return dfText(`Your cart:\n${lines.join('\n')}\nSubtotal: ${formatINR(subtotal)}`);
 }
 
 async function RemoveFromCart(req) {
   const sessionId = sessionIdFromReq(req);
   const params = req.body?.queryResult?.parameters || {};
-  const rawItem = (params.item ?? '').toString().toLowerCase().trim();
-  const qty = Number(params.qty ?? 0); // 0 or missing => remove all of that item
+
+  const rawItem = getItemParam(params);
+  // qty: if provided, remove that many; if missing/0, remove all of that item
+  const qty = Number(params.number ?? params.qty ?? 0);
 
   if (!rawItem) return dfText("Which item should I remove?");
   const cart = getCart(sessionId);
   const idx = cart.items.findIndex(i => i.item === rawItem);
-  if (idx < 0) return dfText(`"${params.item}" isn’t in your cart.`);
+  if (idx < 0) return dfText(`"${rawItem}" isn’t in your cart.`);
 
   if (qty > 0) {
     cart.items[idx].qty -= qty;
@@ -144,14 +160,11 @@ async function Checkout(req) {
   if (!cart.items.length) return dfText("Your cart is empty.");
 
   const subtotal = recalc(cart);
-  const taxRate = 0.05; // e.g., 5% GST
+  const taxRate = 0.05; // Example 5% GST
   const tax = +(subtotal * taxRate).toFixed(2);
   const grand = +(subtotal + tax).toFixed(2);
 
-  // In a real app you would:
-  // 1) Create an order record in DB
-  // 2) Generate an order id
-  // 3) Clear the cart after saving
+  // (Real app: create order record, generate order id, etc.)
   carts.set(sessionId, { items: [], subtotal: 0 });
 
   return dfText(`Order placed ✅ Subtotal ${formatINR(subtotal)}, Tax ${formatINR(tax)}, Total ${formatINR(grand)}.`);
@@ -159,7 +172,6 @@ async function Checkout(req) {
 
 /* -------------------------- Intent Router -------------------------- */
 
-// Map Dialogflow intent displayName -> handler
 const handlers = {
   'Default Welcome Intent': DefaultWelcomeIntent,
   'GetStoreHours': GetStoreHours,
@@ -171,20 +183,22 @@ const handlers = {
   'ClearCart': ClearCart,
   'Checkout': Checkout,
 
-  'Default Fallback Intent': (_req) => dfText("Sorry, I didn’t get that. Try: add a pizza, show my cart, or checkout.")
+  'Default Fallback Intent': (_req) =>
+    dfText("Sorry, I didn’t get that. Try: add a pizza, show my cart, or checkout.")
 };
 
-// Optional aliases if your intent names differ in Dialogflow console:
-handlers['Add to cart']         = handlers['AddToCart'];
-handlers['Show cart']           = handlers['ShowCart'];
-handlers['Remove from cart']    = handlers['RemoveFromCart'];
-handlers['Clear cart']          = handlers['ClearCart'];
-handlers['Store Hours']         = handlers['GetStoreHours'];
-handlers['Order Status']        = handlers['CheckOrderStatus'];
+// Aliases for alternate intent names (keep or add more as needed)
+handlers['Add to cart']       = handlers['AddToCart'];
+handlers['Add Item']          = handlers['AddToCart'];
+handlers['Show cart']         = handlers['ShowCart'];
+handlers['Cart total']        = handlers['ShowCart'];
+handlers['Remove from cart']  = handlers['RemoveFromCart'];
+handlers['Clear cart']        = handlers['ClearCart'];
+handlers['Store Hours']       = handlers['GetStoreHours'];
+handlers['Order Status']      = handlers['CheckOrderStatus'];
 
 /* --------------------------- HTTP Routes --------------------------- */
 
-// Async route so handlers can be async (DB-friendly)
 app.post('/webhook', async (req, res) => {
   try {
     const intent = req.body?.queryResult?.intent?.displayName;
